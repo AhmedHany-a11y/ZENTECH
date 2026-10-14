@@ -159,6 +159,21 @@
   }
   .field input:focus, .field select:focus, .field textarea:focus{border-color:var(--blue);}
   .field .hint{font-size:11px; color:#9AA9BD;}
+  /* ---------- Searchable invoice/customer picker ---------- */
+  .combo{position:relative;}
+  .combo input{width:100%; box-sizing:border-box;}
+  .combo-list{
+    display:none; position:absolute; top:calc(100% + 4px); right:0; left:0; z-index:50;
+    background:#fff; border:1px solid var(--line); border-radius:10px; max-height:230px; overflow-y:auto;
+    box-shadow:0 12px 28px -12px rgba(11,31,58,0.35);
+  }
+  .combo-list.show{display:block;}
+  .combo-item{padding:9px 12px; font-size:13px; cursor:pointer; border-bottom:1px solid #F0F3F8;}
+  .combo-item:last-child{border-bottom:none;}
+  .combo-item:hover, .combo-item.active{background:#EEF4FF;}
+  .combo-item small{display:block; color:var(--ink-soft); font-size:11.5px; margin-top:2px;}
+  .combo-item mark{background:#FFE9A8; color:inherit; border-radius:3px; padding:0 1px;}
+  .combo-empty{padding:10px 12px; font-size:12.5px; color:var(--ink-soft);}
   .form-actions{display:flex; justify-content:flex-end; gap:10px; margin-top:16px;}
 
   /* ---------- Modal ---------- */
@@ -1371,6 +1386,233 @@ async function refreshAutoSaveFolderStatus(){
     : 'لم يتم اختيار مجلد بعد — الفواتير هتتنزّل بالطريقة العادية من المتصفح.';
 }
 
+/* ===================== بحث ملف العميل (لوحة التحكم) ===================== */
+let custSearchQuery = '';
+let custSelectedKey = '';
+
+function custEsc(s){
+  return String(s==null ? '' : s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+// توحيد الاسم للمقارنة: إزالة التشكيل والتطويل وتوحيد الهمزات والتاء المربوطة والياء
+function custNorm(s){
+  return String(s||'').toLowerCase()
+    .replace(/[\u064B-\u065F\u0670\u0640]/g,'')
+    .replace(/[أإآٱ]/g,'ا').replace(/ة/g,'ه').replace(/ى/g,'ي')
+    .replace(/\s+/g,' ').trim();
+}
+// يجمع كل العملاء (من الفواتير وطلبات الدعم) مع بياناتهم كاملة
+function custBuildIndex(){
+  const map = {};
+  const get = (name)=>{
+    const key = custNorm(name);
+    if(!key) return null;
+    if(!map[key]) map[key] = {key, names:{}, phones:new Set(), invoices:[], support:[]};
+    map[key].names[name.trim()] = (map[key].names[name.trim()]||0)+1;
+    return map[key];
+  };
+  DB.invoices.forEach(inv=>{
+    const c = get(inv.customerName||'');
+    if(!c) return;
+    c.invoices.push(inv);
+    if(inv.customerPhone) c.phones.add(String(inv.customerPhone).trim());
+  });
+  const invById = {}; DB.invoices.forEach(i=>invById[i.id]=i);
+  DB.supportRequests.forEach(s=>{
+    let name = s.customerName;
+    if((!name || !custNorm(name)) && s.invoiceId && invById[s.invoiceId]) name = invById[s.invoiceId].customerName;
+    const c = get(name||'');
+    if(!c) return;
+    c.support.push(s);
+    if(s.customerPhone) c.phones.add(String(s.customerPhone).trim());
+  });
+  Object.values(map).forEach(c=>{
+    c.displayName = Object.entries(c.names).sort((a,b)=>b[1]-a[1])[0][0];
+    c.invoices.sort((a,b)=> (a.date||'').localeCompare(b.date||'') || (a.createdAt||'').localeCompare(b.createdAt||''));
+    c.support.sort((a,b)=> (a.date||'').localeCompare(b.date||''));
+  });
+  return map;
+}
+function custMatches(index, q){
+  const nq = custNorm(q);
+  if(!nq) return [];
+  const digits = q.replace(/\D/g,'');
+  return Object.values(index).filter(c=>{
+    if(c.key.includes(nq)) return true;
+    if(digits.length>=4 && [...c.phones].some(p=>p.replace(/\D/g,'').includes(digits))) return true;
+    return false;
+  }).sort((a,b)=>{
+    const as = a.key.startsWith(nq)?0:1, bs = b.key.startsWith(nq)?0:1;
+    return as-bs || a.displayName.localeCompare(b.displayName,'ar');
+  });
+}
+
+function custSearchBoxHtml(){
+  return `
+    <div class="card" style="margin-bottom:20px; padding:16px 18px;">
+      <div class="card-head" style="margin-bottom:10px;">
+        <h3>🔎 البحث عن عميل</h3>
+        <span style="font-size:12px; color:var(--ink-soft);">اكتب اسم العميل لعرض بياناته كاملة من أول تعامل</span>
+      </div>
+      <div style="position:relative; max-width:520px;">
+        <span style="position:absolute; top:50%; right:12px; transform:translateY(-50%); color:var(--ink-soft); display:flex;">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        </span>
+        <input type="text" id="custSearchInput" placeholder="اسم العميل أو رقم تليفونه..." autocomplete="off"
+          value="${custEsc(custSearchQuery)}" oninput="onCustSearchInput(this.value)"
+          style="width:100%; padding:11px 38px 11px 34px; border:1px solid var(--line); border-radius:10px; font-family:inherit; font-size:14px; outline:none; background:#fff; color:var(--ink);">
+        <span id="custClearBtn" onclick="onCustSearchInput('', true)" style="position:absolute; top:50%; left:10px; transform:translateY(-50%); cursor:pointer; color:var(--ink-soft); font-size:13px; display:${custSearchQuery?'block':'none'};" title="مسح البحث">✕</span>
+      </div>
+      <div id="custSearchResults" style="margin-top:14px;">${renderCustSearchResults()}</div>
+    </div>`;
+}
+
+function onCustSearchInput(value, clearInput){
+  custSearchQuery = value;
+  custSelectedKey = '';
+  const input = document.getElementById('custSearchInput');
+  if(clearInput && input){ input.value = ''; input.focus(); }
+  const clr = document.getElementById('custClearBtn');
+  if(clr) clr.style.display = value ? 'block' : 'none';
+  const box = document.getElementById('custSearchResults');
+  if(box) box.innerHTML = renderCustSearchResults();
+}
+function selectCustomer(key){
+  custSelectedKey = key;
+  const box = document.getElementById('custSearchResults');
+  if(box) box.innerHTML = renderCustSearchResults();
+}
+
+function renderCustSearchResults(){
+  const q = (custSearchQuery||'').trim();
+  if(!q) return '';
+  const index = custBuildIndex();
+  let key = custSelectedKey;
+  const matches = custMatches(index, q);
+  if(!key){
+    if(matches.length===0){
+      return `<div style="padding:14px; text-align:center; color:var(--ink-soft); font-size:13.5px; background:var(--paper); border-radius:10px;">لا يوجد عميل بهذا الاسم — جرّب كتابة جزء آخر من الاسم</div>`;
+    }
+    const exact = matches.find(c=>c.key===custNorm(q));
+    if(matches.length===1) key = matches[0].key;
+    else if(exact && matches.length>0 && matches.every(c=>c===exact || !c.key.startsWith(exact.key+' ')) ) key = exact.key;
+  }
+  if(!key){
+    return `
+      <div style="font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;">${matches.length} عميل مطابق — اختر العميل:</div>
+      <div style="display:flex; flex-wrap:wrap; gap:8px;">
+        ${matches.slice(0,40).map(c=>`
+          <button type="button" onclick="selectCustomer('${custEsc(c.key).replace(/'/g,'&#39;')}')"
+            style="border:1px solid var(--line); background:#fff; border-radius:10px; padding:8px 12px; cursor:pointer; font-family:inherit; font-size:13.5px; color:var(--ink); text-align:right;">
+            <b>${custEsc(c.displayName)}</b>
+            <span style="color:var(--ink-soft); font-size:12px;"> • ${c.invoices.length} فاتورة${c.support.length?` • ${c.support.length} دعم`:''}</span>
+          </button>`).join('')}
+      </div>
+      ${matches.length>40 ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:8px;">تم عرض أول 40 نتيجة، اكتب المزيد من الاسم لتضييق البحث.</div>` : ''}`;
+  }
+  const c = index[key];
+  if(!c) return '';
+  return renderCustomerFile(c, matches.length>1);
+}
+
+function renderCustomerFile(c, showBack){
+  const invs = c.invoices;
+  const total = invs.reduce((s,i)=>s+(parseFloat(i.total)||0),0);
+  const devicesQty = invs.reduce((s,i)=>s+invItemsQty(i),0);
+  const received = invs.filter(i=> isDirectCollectionMethod(i.paymentMethod) || i.collectionReceived);
+  const receivedTotal = received.reduce((s,i)=>s+(parseFloat(i.total)||0),0);
+  const pendingTotal = total - receivedTotal;
+  const allDates = [...invs.map(i=>i.date), ...c.support.map(s=>s.date)].filter(Boolean).sort();
+  const first = allDates[0] || '—';
+  const last = allDates[allDates.length-1] || '—';
+  const phones = [...c.phones];
+  const otherNames = Object.keys(c.names).filter(n=>n!==c.displayName);
+  const openSupport = c.support.filter(s=>s.status!=='resolved').length;
+
+  const kpi = (label, value, sub, color)=>`
+    <div style="background:var(--paper); border:1px solid var(--line); border-radius:12px; padding:12px 14px;">
+      <div style="font-size:12px; color:var(--ink-soft); font-weight:700; margin-bottom:4px;"><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${color}; margin-inline-end:6px;"></span>${label}</div>
+      <div style="font-size:19px; font-weight:900;">${value}</div>
+      <div style="font-size:11.5px; color:var(--ink-soft);">${sub}</div>
+    </div>`;
+
+  return `
+    <div style="border-top:1px dashed var(--line); padding-top:16px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px; margin-bottom:14px;">
+        <div>
+          <div style="font-size:19px; font-weight:900;">${custEsc(c.displayName)}</div>
+          <div style="font-size:12.5px; color:var(--ink-soft); margin-top:4px; line-height:1.9;">
+            ${phones.length ? `📞 <span class="num">${phones.map(custEsc).join(' ، ')}</span><br>` : ''}
+            ${otherNames.length ? `يظهر أيضًا بصيغ: ${otherNames.map(custEsc).join(' ، ')}<br>` : ''}
+            أول تعامل: <b class="num">${custEsc(first)}</b> &nbsp;•&nbsp; آخر تعامل: <b class="num">${custEsc(last)}</b>
+          </div>
+        </div>
+        ${showBack ? `<button type="button" class="btn btn-ghost" onclick="selectCustomer('')">← رجوع لنتائج البحث</button>` : ''}
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:18px;">
+        ${kpi('عدد الفواتير', invs.length, `${devicesQty} جهاز/صنف`, 'var(--blue)')}
+        ${kpi('إجمالي المشتريات', fmt(total), 'جنيه', 'var(--mint)')}
+        ${kpi('تم استلام تحصيله', fmt(receivedTotal), 'جنيه', 'var(--blue-deep)')}
+        ${kpi('لسه مع الفني', fmt(pendingTotal), 'جنيه', 'var(--amber)')}
+        ${kpi('طلبات الدعم', c.support.length, openSupport ? `${openSupport} غير منتهي` : 'لا يوجد معلّق', '#8B5CF6')}
+      </div>
+
+      <h4 style="margin:0 0 8px; font-size:14.5px; font-weight:800;">🧾 الفواتير (من الأقدم للأحدث)</h4>
+      ${invs.length ? `
+      <div style="overflow-x:auto; margin-bottom:20px;">
+        <table>
+          <thead><tr>
+            <th>التاريخ</th><th>رقم الفاتورة</th><th>الأصناف</th><th>السيريال</th><th>الإجمالي</th>
+            <th>طريقة التحصيل</th><th>استلام التحصيل</th><th>الفني</th><th>السيلز</th><th>نوع التركيب</th><th>ملاحظات</th><th></th>
+          </tr></thead>
+          <tbody>
+            ${invs.map(i=>{
+              const its = invItems(i);
+              const serials = its.filter(it=>it.serialNumber).map(it=>`<span class="mono" style="font-size:12px;">${custEsc(it.serialNumber)}</span>`).join('<br>') || '—';
+              return `<tr>
+                <td class="num">${custEsc(i.date)}</td>
+                <td class="num">${custEsc(i.invoiceNumber||i.id)}</td>
+                <td>${its.length ? its.map(it=>`${custEsc(it.deviceName)}<span style="color:var(--ink-soft);"> ×${custEsc(it.qty)} (${fmt((parseFloat(it.unitPrice)||0))})</span>`).join('<br>') : '—'}</td>
+                <td>${serials}</td>
+                <td class="num" style="font-weight:800;">${fmt(i.total)}</td>
+                <td><span class="pill ${paymentMethodPill(i.paymentMethod)}">${paymentMethodLabel(i.paymentMethod)}</span></td>
+                <td>${isDirectCollectionMethod(i.paymentMethod)
+                  ? `<span class="pill pill-blue">تحويل مباشر</span>`
+                  : `<span class="pill ${i.collectionReceived?'pill-mint':'pill-amber'}">${i.collectionReceived ? ('مستلم' + (i.collectionReceivedDate ? ' في '+custEsc(i.collectionReceivedDate) : '')) : 'لسه مع الفني'}</span>`}</td>
+                <td>${custEsc(i.technicianName||'—')}</td>
+                <td>${custEsc(i.salesName||'—')}</td>
+                <td>${i.installationType==='access' ? 'أكسيس' : 'بصمة'}${i.installationType==='fingerprint' && i.governorate ? `<br><span style="color:var(--ink-soft); font-size:12px;">${custEsc(i.governorate)}</span>` : ''}</td>
+                <td style="max-width:180px;">${custEsc(i.notes||'—')}</td>
+                <td style="white-space:nowrap;">
+                  <span class="btn-danger-text" style="cursor:pointer; color:var(--blue-deep);" onclick="showInvoiceForm('${i.id}')">تعديل</span>
+                  <span class="btn-danger-text" style="cursor:pointer; color:var(--blue-deep);" onclick="printInvoice('${i.id}')">طباعة</span>
+                </td>
+              </tr>`;}).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div style="color:var(--ink-soft); font-size:13px; margin-bottom:20px;">لا توجد فواتير مسجلة لهذا العميل.</div>`}
+
+      <h4 style="margin:0 0 8px; font-size:14.5px; font-weight:800;">🛠️ طلبات الدعم الفني</h4>
+      ${c.support.length ? `
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>التاريخ</th><th>الفاتورة</th><th>المشكلة</th><th>الفني</th><th>الحالة</th><th>ملاحظات الحل</th><th></th></tr></thead>
+          <tbody>
+            ${c.support.map(s=>`<tr>
+              <td class="num">${custEsc(s.date)}</td>
+              <td class="num">${custEsc(s.invoiceNumber||'—')}</td>
+              <td style="max-width:220px;">${custEsc(s.problem||'—')}</td>
+              <td>${custEsc(s.technicianName||'—')}</td>
+              <td><span class="pill ${supportStatusPill(s.status)}">${supportStatusLabel(s.status)}</span></td>
+              <td style="max-width:200px;">${custEsc(s.resolutionNotes||'—')}</td>
+              <td><span class="btn-danger-text" style="cursor:pointer; color:var(--blue-deep);" onclick="showSupportForm('${s.id}')">تعديل</span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div style="color:var(--ink-soft); font-size:13px;">لا توجد طلبات دعم فني لهذا العميل.</div>`}
+    </div>`;
+}
+
 /* ===================== Dashboard ===================== */
 function renderDashboard(){
   const totalSales = DB.invoices.reduce((s,i)=>s+i.total,0);
@@ -1395,6 +1637,8 @@ function renderDashboard(){
       </div>
       <button class="btn btn-primary" onclick="showInvoiceForm()">${iconPlus()} فاتورة جديدة</button>
     </div>
+
+    ${custSearchBoxHtml()}
 
     <div class="kpis">
       <div class="kpi">
@@ -2745,17 +2989,24 @@ function showSupportForm(id){
   const editing = !!id;
   const s = editing ? DB.supportRequests.find(x=>x.id===id) : null;
   if(editing && !s){ toast('طلب الدعم غير موجود'); return; }
-  const invoicesSorted = [...DB.invoices].sort((a,b)=> b.date.localeCompare(a.date));
+  const invoicesSorted = [...DB.invoices].sort((a,b)=> (b.date||'').localeCompare(a.date||''));
+  supportInvoiceOptions = invoicesSorted;
+  const selInv = editing && s.invoiceId ? DB.invoices.find(x=>x.id===s.invoiceId) : null;
+  const selectedInvLabel = selInv ? supportInvoiceLabel(selInv) : '';
   openModal(`
     <div class="modal-head"><h3>${editing ? 'تعديل طلب دعم فني' : 'تسجيل طلب دعم فني'}</h3><div class="close-x" onclick="closeModal()">✕</div></div>
     <form id="supportForm">
       <div class="form-grid">
         <div class="field full">
-          <label>ربط بفاتورة (اختياري)</label>
-          <select name="invoiceId" onchange="onSupportInvoiceSelect(this)">
-            <option value="">بدون ربط بفاتورة — إدخال بيانات العميل يدويًا</option>
-            ${invoicesSorted.map(inv=>`<option value="${inv.id}" data-name="${(inv.customerName||'').replace(/"/g,'&quot;')}" data-phone="${(inv.customerPhone||'').replace(/"/g,'&quot;')}" ${editing && s.invoiceId===inv.id ? 'selected':''}>${inv.invoiceNumber||inv.id} — ${inv.customerName} (${inv.date})</option>`).join('')}
-          </select>
+          <label>بحث عن عميل / ربط بفاتورة (اختياري)</label>
+          <div class="combo">
+            <input type="hidden" name="invoiceId" id="supportInvoiceId" value="${editing && s.invoiceId ? s.invoiceId : ''}">
+            <input type="text" id="supportInvoiceSearch" autocomplete="off" placeholder="اكتب اسم العميل أو جزء منه (أو رقم التليفون / رقم الفاتورة)..."
+              value="${selectedInvLabel.replace(/"/g,'&quot;')}"
+              oninput="onSupportInvoiceSearch(this.value)" onfocus="onSupportInvoiceSearch(this.value, true)" onkeydown="onSupportInvoiceKey(event)">
+            <div class="combo-list" id="supportInvoiceList"></div>
+          </div>
+          <div class="hint">اختياري — لو سبت الخانة فاضية تقدر تكتب بيانات العميل يدويًا تحت</div>
         </div>
         <div class="field"><label>اسم العميل</label><input type="text" name="customerName" id="supportCustomerName" placeholder="اسم العميل" value="${editing ? (s.customerName||'') : ''}" required></div>
         <div class="field"><label>رقم تليفون العميل</label><input type="text" name="customerPhone" id="supportCustomerPhone" placeholder="رقم التليفون" value="${editing ? (s.customerPhone||'') : ''}"></div>
@@ -2825,14 +3076,85 @@ function showSupportForm(id){
   });
 }
 
-function onSupportInvoiceSelect(sel){
-  const opt = sel.options[sel.selectedIndex];
-  if(!opt || !opt.value) return;
+let supportInvoiceOptions = [];
+let supportComboIndex = -1;
+
+function supportInvoiceLabel(inv){
+  return `${inv.invoiceNumber||inv.id} — ${inv.customerName||''} (${inv.date||''})`;
+}
+function supportEsc(t){
+  return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function supportHighlight(text, q){
+  const t = String(text==null?'':text);
+  if(!q) return supportEsc(t);
+  const i = t.toLowerCase().indexOf(q);
+  if(i<0) return supportEsc(t);
+  return supportEsc(t.slice(0,i)) + '<mark>' + supportEsc(t.slice(i,i+q.length)) + '</mark>' + supportEsc(t.slice(i+q.length));
+}
+function onSupportInvoiceSearch(value, onlyOpen){
+  const list = document.getElementById('supportInvoiceList');
+  const hidden = document.getElementById('supportInvoiceId');
+  if(!list) return;
+  // لو المستخدم بيكتب، يتفك الربط بالفاتورة القديمة لحد ما يختار فاتورة جديدة
+  if(!onlyOpen && hidden) hidden.value = '';
+  const q = (value||'').trim().toLowerCase();
+  const matches = supportInvoiceOptions.filter(inv=>{
+    if(!q) return true;
+    return [inv.customerName, inv.customerPhone, inv.invoiceNumber, inv.id, inv.date]
+      .some(v=> String(v==null?'':v).toLowerCase().includes(q));
+  }).slice(0,50);
+  supportComboIndex = -1;
+  if(!matches.length){
+    list.innerHTML = '<div class="combo-empty">لا توجد نتائج — تقدر تكتب بيانات العميل يدويًا تحت</div>';
+  } else {
+    list.innerHTML = matches.map(inv=>`
+      <div class="combo-item" data-id="${supportEsc(inv.id)}" onmousedown="event.preventDefault(); pickSupportInvoice('${supportEsc(inv.id)}')">
+        ${supportHighlight(inv.customerName||'', q)}
+        <small>فاتورة ${supportHighlight(inv.invoiceNumber||inv.id, q)} • ${supportHighlight(inv.customerPhone||'بدون رقم', q)} • ${supportEsc(inv.date||'')}</small>
+      </div>`).join('');
+  }
+  list.classList.add('show');
+}
+function pickSupportInvoice(id){
+  const inv = DB.invoices.find(x=>x.id===id);
+  if(!inv) return;
+  const hidden = document.getElementById('supportInvoiceId');
+  const search = document.getElementById('supportInvoiceSearch');
   const nameField = document.getElementById('supportCustomerName');
   const phoneField = document.getElementById('supportCustomerPhone');
-  if(nameField) nameField.value = opt.getAttribute('data-name') || '';
-  if(phoneField) phoneField.value = opt.getAttribute('data-phone') || '';
+  const list = document.getElementById('supportInvoiceList');
+  if(hidden) hidden.value = inv.id;
+  if(search) search.value = supportInvoiceLabel(inv);
+  if(nameField) nameField.value = inv.customerName || '';
+  if(phoneField) phoneField.value = inv.customerPhone || '';
+  if(list) list.classList.remove('show');
 }
+function onSupportInvoiceKey(e){
+  const list = document.getElementById('supportInvoiceList');
+  if(!list) return;
+  const items = [...list.querySelectorAll('.combo-item')];
+  if(e.key==='ArrowDown' || e.key==='ArrowUp'){
+    if(!list.classList.contains('show')) onSupportInvoiceSearch(e.target.value, true);
+    e.preventDefault();
+    if(!items.length) return;
+    supportComboIndex = e.key==='ArrowDown' ? Math.min(items.length-1, supportComboIndex+1) : Math.max(0, supportComboIndex-1);
+    items.forEach((el,i)=> el.classList.toggle('active', i===supportComboIndex));
+    items[supportComboIndex].scrollIntoView({block:'nearest'});
+  } else if(e.key==='Enter'){
+    if(list.classList.contains('show') && items.length){
+      e.preventDefault();
+      pickSupportInvoice(items[Math.max(0,supportComboIndex)].getAttribute('data-id'));
+    }
+  } else if(e.key==='Escape'){
+    list.classList.remove('show');
+  }
+}
+// إغلاق قائمة النتائج عند الضغط في أي مكان خارجها
+document.addEventListener('click', (e)=>{
+  const list = document.getElementById('supportInvoiceList');
+  if(list && !e.target.closest('.combo')) list.classList.remove('show');
+});
 
 async function cycleSupportStatus(id){
   const s = DB.supportRequests.find(x=>x.id===id);
